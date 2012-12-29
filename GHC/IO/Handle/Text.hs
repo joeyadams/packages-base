@@ -35,28 +35,25 @@ module GHC.IO.Handle.Text (
     ) where
 
 import GHC.IO
-import GHC.IO.FD
 import GHC.IO.Buffer
-import qualified GHC.IO.BufferedIO as Buffered
+import GHC.IO.BufferedIO (BufferedIO)
+import qualified GHC.IO.BufferedIO as BufferedIO
 import GHC.IO.Exception
 import GHC.Exception
 import GHC.IO.Handle.Types
 import GHC.IO.Handle.Internals
 import qualified GHC.IO.Device as IODevice
-import qualified GHC.IO.Device as RawIO
 
 import Foreign
 import Foreign.C
 
 import qualified Control.Exception as Exception
-import Data.Typeable
 import System.IO.Error
 import Data.Maybe
 import Control.Monad
 
 import GHC.IORef
 import GHC.Base
-import GHC.Real
 import GHC.Num
 import GHC.Show
 import GHC.List
@@ -698,76 +695,47 @@ hPutBuf :: Handle                       -- handle to write to
         -> Ptr a                        -- address of buffer
         -> Int                          -- number of bytes of data in buffer
         -> IO ()
-hPutBuf h ptr count = do _ <- hPutBuf' h ptr count True
-                         return ()
+hPutBuf handle ptr count
+  | count == 0 = return ()
+  | count <  0 = illegalBufferSize handle "hPutBuf" count
+  | otherwise =
+    wantWritableHandle "hPutBuf" handle $
+      \Handle__{..} -> do
+          debugIO ("hPutBuf count=" ++ show count)
+          let needFlush = bufferModeNeedsFlush haBufferMode
+          buf <- readIORef haByteBuffer
+          !buf' <- BufferedIO.writeBuffered haDevice needFlush buf
+                                            (castPtr ptr) count
+          writeIORef haByteBuffer buf'
 
+-- | Non-blocking version of 'hPutBuf'.  Returns the number of bytes written,
+-- which may be a short count or zero.
 hPutBufNonBlocking
         :: Handle                       -- handle to write to
         -> Ptr a                        -- address of buffer
         -> Int                          -- number of bytes of data in buffer
         -> IO Int                       -- returns: number of bytes written
-hPutBufNonBlocking h ptr count = hPutBuf' h ptr count False
-
-hPutBuf':: Handle                       -- handle to write to
-        -> Ptr a                        -- address of buffer
-        -> Int                          -- number of bytes of data in buffer
-        -> Bool                         -- allow blocking?
-        -> IO Int
-hPutBuf' handle ptr count can_block
+hPutBufNonBlocking handle ptr count
   | count == 0 = return 0
-  | count <  0 = illegalBufferSize handle "hPutBuf" count
-  | otherwise = 
-    wantWritableHandle "hPutBuf" handle $ 
-      \ h_@Handle__{..} -> do
-          debugIO ("hPutBuf count=" ++ show count)
-
-          r <- bufWrite h_ (castPtr ptr) count can_block
-
-          -- we must flush if this Handle is set to NoBuffering.  If
-          -- it is set to LineBuffering, be conservative and flush
-          -- anyway (we didn't check for newlines in the data).
-          case haBufferMode of
-             BlockBuffering _      -> do return ()
-             _line_or_no_buffering -> do flushWriteBuffer h_
+  | count <  0 = illegalBufferSize handle "hPutBufNonBlocking" count
+  | otherwise =
+    wantWritableHandle "hPutBufNonBlocking" handle $
+      \Handle__{..} -> do
+          debugIO ("hPutBufNonBlocking count=" ++ show count)
+          let needFlush = bufferModeNeedsFlush haBufferMode
+          buf <- readIORef haByteBuffer
+          (!r, !buf') <- BufferedIO.writeBuffered0 haDevice needFlush buf
+                                                   (castPtr ptr) count
+          writeIORef haByteBuffer buf'
           return r
 
-bufWrite :: Handle__-> Ptr Word8 -> Int -> Bool -> IO Int
-bufWrite h_@Handle__{..} ptr count can_block =
-  seq count $ do  -- strictness hack
-  old_buf@Buffer{ bufRaw=old_raw, bufR=w, bufSize=size }
-     <- readIORef haByteBuffer
-
-  -- enough room in handle buffer?
-  if (size - w > count)
-        -- There's enough room in the buffer:
-        -- just copy the data in and update bufR.
-        then do debugIO ("hPutBuf: copying to buffer, w=" ++ show w)
-                copyToRawBuffer old_raw w ptr count
-                writeIORef haByteBuffer old_buf{ bufR = w + count }
-                return count
-
-        -- else, we have to flush
-        else do debugIO "hPutBuf: flushing first"
-                old_buf' <- Buffered.flushWriteBuffer haDevice old_buf
-                        -- TODO: we should do a non-blocking flush here
-                writeIORef haByteBuffer old_buf'
-                -- if we can fit in the buffer, then just loop  
-                if count < size
-                   then bufWrite h_ ptr count can_block
-                   else if can_block
-                           then do writeChunk h_ (castPtr ptr) count
-                                   return count
-                           else writeChunkNonBlocking h_ (castPtr ptr) count
-
-writeChunk :: Handle__ -> Ptr Word8 -> Int -> IO ()
-writeChunk h_@Handle__{..} ptr bytes
-  | Just fd <- cast haDevice  =  RawIO.write (fd::FD) ptr bytes
-  | otherwise = error "Todo: hPutBuf"
-
-writeChunkNonBlocking :: Handle__ -> Ptr Word8 -> Int -> IO Int
-writeChunkNonBlocking h_@Handle__{..} ptr bytes 
-  | Just fd <- cast haDevice  =  RawIO.writeNonBlocking (fd::FD) ptr bytes
-  | otherwise = error "Todo: hPutBuf"
+-- We must flush if the Handle is set to NoBuffering.
+-- If it is set to LineBuffering, be conservative and flush
+-- anyway (we didn't check for newlines in the data).
+bufferModeNeedsFlush :: BufferMode -> Bool
+bufferModeNeedsFlush NoBuffering        = True
+bufferModeNeedsFlush LineBuffering      = True
+bufferModeNeedsFlush (BlockBuffering _) = False
 
 -- ---------------------------------------------------------------------------
 -- hGetBuf
@@ -794,60 +762,28 @@ hGetBuf h ptr count
   | otherwise = 
       wantReadableHandle_ "hGetBuf" h $ \ h_@Handle__{..} -> do
          flushCharReadBuffer h_
-         buf@Buffer{ bufRaw=raw, bufR=w, bufL=r, bufSize=sz }
-            <- readIORef haByteBuffer
-         if isEmptyBuffer buf
-            then bufReadEmpty    h_ buf (castPtr ptr) 0 count
-            else bufReadNonEmpty h_ buf (castPtr ptr) 0 count
+         buf <- readIORef haByteBuffer
+         (!r, !buf') <- readAllBuffered haDevice buf (castPtr ptr) count
+         writeIORef haByteBuffer buf'
+         return r
 
--- small reads go through the buffer, large reads are satisfied by
--- taking data first from the buffer and then direct from the file
--- descriptor.
+readAllBuffered :: BufferedIO dev
+                => dev -> Buffer Word8 -> Ptr Word8 -> Int
+                -> IO (Int, Buffer Word8)
+readAllBuffered dev buf0 ptr0 count0 =
+    go buf0 ptr0 count0
+  where
+    go buf ptr count = do
+        (!r, !buf') <- BufferedIO.readBuffered dev buf ptr count
+        let !ptr'    = ptr `plusPtr` r
+            !count'  = count - r
+        if count' <= 0 || r <= 0  -- read satisfied or EOF
+           then done buf' ptr'
+           else go buf' ptr' count'
 
-bufReadNonEmpty :: Handle__ -> Buffer Word8 -> Ptr Word8 -> Int -> Int -> IO Int
-bufReadNonEmpty h_@Handle__{..}
-                buf@Buffer{ bufRaw=raw, bufR=w, bufL=r, bufSize=sz }
-                ptr !so_far !count 
- = do
-        let avail = w - r
-        if (count < avail)
-           then do 
-                copyFromRawBuffer ptr raw r count
-                writeIORef haByteBuffer buf{ bufL = r + count }
-                return (so_far + count)
-           else do
-  
-        copyFromRawBuffer ptr raw r avail
-        let buf' = buf{ bufR=0, bufL=0 }
-        writeIORef haByteBuffer buf'
-        let remaining = count - avail
-            so_far' = so_far + avail
-            ptr' = ptr `plusPtr` avail
-
-        if remaining == 0 
-           then return so_far'
-           else bufReadEmpty h_ buf' ptr' so_far' remaining
-
-
-bufReadEmpty :: Handle__ -> Buffer Word8 -> Ptr Word8 -> Int -> Int -> IO Int
-bufReadEmpty h_@Handle__{..}
-             buf@Buffer{ bufRaw=raw, bufR=w, bufL=r, bufSize=sz }
-             ptr so_far count
- | count > sz, Just fd <- cast haDevice = loop fd 0 count
- | otherwise = do
-     (r,buf') <- Buffered.fillReadBuffer haDevice buf
-     if r == 0 
-        then return so_far
-        else do writeIORef haByteBuffer buf'
-                bufReadNonEmpty h_ buf' ptr so_far count
- where
-  loop :: FD -> Int -> Int -> IO Int
-  loop fd off bytes | bytes <= 0 = return (so_far + off)
-  loop fd off bytes = do
-    r <- RawIO.read (fd::FD) (ptr `plusPtr` off) bytes
-    if r == 0
-        then return (so_far + off)
-        else loop fd (off + r) (bytes - r)
+    done buf ptr = do
+        let !r = ptr `minusPtr` ptr0
+        return (r, buf)
 
 -- ---------------------------------------------------------------------------
 -- hGetBufSome
@@ -876,27 +812,10 @@ hGetBufSome h ptr count
   | otherwise =
       wantReadableHandle_ "hGetBufSome" h $ \ h_@Handle__{..} -> do
          flushCharReadBuffer h_
-         buf@Buffer{ bufSize=sz } <- readIORef haByteBuffer
-         if isEmptyBuffer buf
-            then if count > sz  -- large read?
-                    then do RawIO.read (haFD h_) (castPtr ptr) count
-                    else do (r,buf') <- Buffered.fillReadBuffer haDevice buf
-                            if r == 0
-                               then return 0
-                               else do writeIORef haByteBuffer buf'
-                                       bufReadNBNonEmpty h_ buf' (castPtr ptr) 0 (min r count)
-                                        -- new count is  (min r count), so
-                                        -- that bufReadNBNonEmpty will not
-                                        -- issue another read.
-            else
-              let count' = min count (bufferElems buf)
-              in bufReadNBNonEmpty h_ buf (castPtr ptr) 0 count'
-
-haFD :: Handle__ -> FD
-haFD h_@Handle__{..} =
-   case cast haDevice of
-             Nothing -> error "not an FD"
-             Just fd -> fd
+         buf <- readIORef haByteBuffer
+         (!r, !buf') <- BufferedIO.readBuffered haDevice buf (castPtr ptr) count
+         writeIORef haByteBuffer buf'
+         return r
 
 -- | 'hGetBufNonBlocking' @hdl buf count@ reads data from the handle @hdl@
 -- into the buffer @buf@ until either EOF is reached, or
@@ -914,8 +833,8 @@ haFD h_@Handle__{..} =
 -- 'hGetBufNonBlocking' ignores the prevailing 'TextEncoding' and
 -- 'NewlineMode' on the 'Handle', and reads bytes directly.
 --
--- NOTE: on Windows, this function does not work correctly; it
--- behaves identically to 'hGetBuf'.
+-- NOTE: on Windows, this function does not work correctly for files;
+-- it behaves identically to 'hGetBufSome'.
 
 hGetBufNonBlocking :: Handle -> Ptr a -> Int -> IO Int
 hGetBufNonBlocking h ptr count
@@ -924,79 +843,13 @@ hGetBufNonBlocking h ptr count
   | otherwise = 
       wantReadableHandle_ "hGetBufNonBlocking" h $ \ h_@Handle__{..} -> do
          flushCharReadBuffer h_
-         buf@Buffer{ bufRaw=raw, bufR=w, bufL=r, bufSize=sz }
-            <- readIORef haByteBuffer
-         if isEmptyBuffer buf
-            then bufReadNBEmpty    h_ buf (castPtr ptr) 0 count
-            else bufReadNBNonEmpty h_ buf (castPtr ptr) 0 count
-
-bufReadNBEmpty :: Handle__ -> Buffer Word8 -> Ptr Word8 -> Int -> Int -> IO Int
-bufReadNBEmpty   h_@Handle__{..}
-                 buf@Buffer{ bufRaw=raw, bufR=w, bufL=r, bufSize=sz }
-                 ptr so_far count
-  | count > sz,
-    Just fd <- cast haDevice = do
-       m <- RawIO.readNonBlocking (fd::FD) ptr count
-       case m of
-         Nothing -> return so_far
-         Just n  -> return (so_far + n)
-
- | otherwise = do
-     buf <- readIORef haByteBuffer
-     (r,buf') <- Buffered.fillReadBuffer0 haDevice buf
-     case r of
-       Nothing -> return so_far
-       Just 0  -> return so_far
-       Just r  -> do
+         buf <- readIORef haByteBuffer
+         (r, !buf') <- BufferedIO.readBuffered0 haDevice buf (castPtr ptr) count
          writeIORef haByteBuffer buf'
-         bufReadNBNonEmpty h_ buf' ptr so_far (min count r)
-                          -- NOTE: new count is    min count r
-                          -- so we will just copy the contents of the
-                          -- buffer in the recursive call, and not
-                          -- loop again.
-
-
-bufReadNBNonEmpty :: Handle__ -> Buffer Word8 -> Ptr Word8 -> Int -> Int -> IO Int
-bufReadNBNonEmpty h_@Handle__{..}
-                  buf@Buffer{ bufRaw=raw, bufR=w, bufL=r, bufSize=sz }
-                  ptr so_far count
-  = do
-        let avail = w - r
-        if (count < avail)
-           then do 
-                copyFromRawBuffer ptr raw r count
-                writeIORef haByteBuffer buf{ bufL = r + count }
-                return (so_far + count)
-           else do
-
-        copyFromRawBuffer ptr raw r avail
-        let buf' = buf{ bufR=0, bufL=0 }
-        writeIORef haByteBuffer buf'
-        let remaining = count - avail
-            so_far' = so_far + avail
-            ptr' = ptr `plusPtr` avail
-
-        if remaining == 0
-           then return so_far'
-           else bufReadNBEmpty h_ buf' ptr' so_far' remaining
-
--- ---------------------------------------------------------------------------
--- memcpy wrappers
-
-copyToRawBuffer :: RawBuffer e -> Int -> Ptr e -> Int -> IO ()
-copyToRawBuffer raw off ptr bytes =
- withRawBuffer raw $ \praw ->
-   do _ <- memcpy (praw `plusPtr` off) ptr (fromIntegral bytes)
-      return ()
-
-copyFromRawBuffer :: Ptr e -> RawBuffer e -> Int -> Int -> IO ()
-copyFromRawBuffer ptr raw off bytes =
- withRawBuffer raw $ \praw ->
-   do _ <- memcpy ptr (praw `plusPtr` off) (fromIntegral bytes)
-      return ()
-
-foreign import ccall unsafe "memcpy"
-   memcpy :: Ptr a -> Ptr a -> CSize -> IO (Ptr ())
+         case r of
+             Nothing            -> return 0 -- EOF
+             Just n | n <= 0    -> return 0 -- No data available right now
+                    | otherwise -> return n
 
 -----------------------------------------------------------------------------
 -- Internal Utils
@@ -1008,3 +861,7 @@ illegalBufferSize handle fn sz =
                             ("illegal buffer size " ++ showsPrec 9 sz [])
                             Nothing Nothing)
 
+-- GHC.IO.Handle.Text used to use memcpy, but now it doesn't.
+-- Still need to export it, as older versions did.
+foreign import ccall unsafe "memcpy"
+   memcpy :: Ptr a -> Ptr a -> CSize -> IO (Ptr ())
