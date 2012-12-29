@@ -28,6 +28,7 @@ module GHC.IO.BufferedIO (
 
         -- * Implementing BufferedIO using RawIO
         -- $rawio
+        defaultBufferSize,
         readBuf,
         readBufNonBlocking,
         rawIOReadBuffered,
@@ -157,7 +158,7 @@ for an object that supports 'RawIO'.  For example, here is how the
 
 @
 instance 'BufferedIO' 'FD' where
-  'newBuffer' _dev state = 'newByteBuffer' 'dEFAULT_FD_BUFFER_SIZE' state
+  'newBuffer' _dev state = 'newByteBuffer' 'defaultBufferSize' state
   'fillReadBuffer'    = 'readBuf'
   'fillReadBuffer0'   = 'readBufNonBlocking'
   'readBuffered'      = 'rawIOReadBuffered'
@@ -168,6 +169,13 @@ instance 'BufferedIO' 'FD' where
   'writeBuffered0'    = 'rawIOWriteBuffered0'
 @
 -}
+
+-- We used to use System.Posix.Internals.dEFAULT_BUFFER_SIZE, which is
+-- taken from the value of BUFSIZ on the current platform.  This value
+-- varies too much though: it is 512 on Windows, 1024 on OS X and 8192
+-- on Linux.  So let's just use a decent size on every platform:
+defaultBufferSize :: Int
+defaultBufferSize = 8096
 
 readBuf :: RawIO dev => dev -> Buffer Word8 -> IO (Int, Buffer Word8)
 readBuf dev bbuf = do
