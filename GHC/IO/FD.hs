@@ -121,10 +121,14 @@ instance GHC.IO.Device.IODevice FD where
 
 instance BufferedIO FD where
   newBuffer _dev state = newByteBuffer defaultBufferSize state
-  fillReadBuffer    fd buf = readBuf' fd buf
-  fillReadBuffer0   fd buf = readBufNonBlocking fd buf
-  flushWriteBuffer  fd buf = writeBuf' fd buf
-  flushWriteBuffer0 fd buf = writeBufNonBlocking fd buf
+  fillReadBuffer    = readBuf'
+  fillReadBuffer0   = readBufNonBlocking
+  readBuffered      = rawIOReadBuffered
+  readBuffered0     = rawIOReadBuffered0
+  flushWriteBuffer  = writeBuf'
+  flushWriteBuffer0 = writeBufNonBlocking
+  writeBuffered     = rawIOWriteBuffered
+  writeBuffered0    = rawIOWriteBuffered0
 
 readBuf' :: FD -> Buffer Word8 -> IO (Int, Buffer Word8)
 readBuf' fd buf = do
