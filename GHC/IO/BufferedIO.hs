@@ -175,7 +175,7 @@ instance 'BufferedIO' 'FD' where
 -- varies too much though: it is 512 on Windows, 1024 on OS X and 8192
 -- on Linux.  So let's just use a decent size on every platform:
 defaultBufferSize :: Int
-defaultBufferSize = 8096
+defaultBufferSize = 8192
 
 readBuf :: RawIO dev => dev -> Buffer Word8 -> IO (Int, Buffer Word8)
 readBuf dev bbuf = do
