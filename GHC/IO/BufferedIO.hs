@@ -78,6 +78,10 @@ class BufferedIO dev where
   -- | Read some bytes, copying them to the given address.  Block only if no
   -- data is available yet.  Return 0 to signal EOF.
   --
+  -- 'readBuffered' may return a short count even if more data is immediately available.
+  -- However, it may only block if the buffer is empty and the underlying
+  -- device is not ready to read.
+  --
   -- The default implementation uses 'fillReadBuffer'.  If the device supports
   -- 'RawIO', use @readBuffered = 'rawIOReadBuffered'@ to avoid unnecessary
   -- copying for large reads.
@@ -87,6 +91,10 @@ class BufferedIO dev where
   readBuffered = defaultReadBuffered
 
   -- | Non-blocking version of 'readBuffered'.  Return 'Nothing' to signal EOF.
+  -- Return @'Just' 0@ if and only if a call to 'readBuffered' with the same
+  -- parameters would block.
+  --
+  -- 'readBuffered0' is never called with count <= 0.
   readBuffered0 :: dev -> Buffer Word8 -> Ptr Word8 -> Int -> IO (Maybe Int, Buffer Word8)
   readBuffered0 = defaultReadBuffered0
 
@@ -113,24 +121,39 @@ class BufferedIO dev where
 
   -- | Write all of the given bytes.
   --
+  -- If @flushAfter@ is 'True', flush after writing, returning an
+  -- empty 'Buffer'.
+  --
   -- The default implementation uses 'flushWriteBuffer'.  If the device
   -- supports 'RawIO', use @writeBuffered = 'rawIOWriteBuffered'@ to avoid
   -- unnecessary copying for large writes.
   --
   -- 'writeBuffered' is never called with count <= 0.
   writeBuffered :: dev
-                -> Bool             -- ^ If 'True', flush after writing.
+                -> Bool             -- ^ @flushAfter@
                 -> Buffer Word8
                 -> Ptr Word8
                 -> Int
                 -> IO (Buffer Word8)
   writeBuffered = defaultWriteBuffered
 
-  -- | Non-blocking version of 'writeBuffered'
+  -- | Non-blocking version of 'writeBuffered'.  Returns the number of
+  -- bytes written.
   --
-  -- Warning: the default implementation does a blocking flush when flush-after
-  -- is 'True', so that bytes written to the buffer are actually sent.
-  -- Use 'rawIOWriteBuffered0' instead, which does not have this problem.
+  -- If @flushAfter@ is 'True', any bytes copied to the buffer by this method
+  -- must be flushed out.
+  --
+  -- If the underlying device is ready to be written to, 'writeBuffered0' must
+  -- make progress, either by copying bytes to the buffer, writing bytes to
+  -- the device, or both.
+  --
+  -- Warning: the default implementation uses 'flushWriteBuffer'
+  -- (blocking flush) when @flushAfter@ is 'True', so that bytes written to the
+  -- buffer are actually sent.  If your 'flushWriteBuffer' method could
+  -- potentially block, consider using 'rawIOWriteBuffered0' instead, which
+  -- does not have this problem.
+  --
+  -- 'writeBuffered0' is never called with count <= 0.
   writeBuffered0 :: dev
                  -> Bool -> Buffer Word8 -> Ptr Word8 -> Int
                  -> IO (Int, Buffer Word8)
